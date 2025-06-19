@@ -7,3 +7,6 @@ bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/hea
 ````
 bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/heads/main/create-admin-user.sh)"
 ````
+```
+bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/heads/main/pve-replication-link.sh)"
+```
