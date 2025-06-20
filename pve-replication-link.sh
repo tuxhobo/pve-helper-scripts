@@ -1,159 +1,180 @@
 #!/bin/bash
+
 set -euo pipefail
 
-SCRIPT_VERSION="0.2"
-TMP_FILE="/tmp/ifcfg-bond-temp.$$"
+VERSION="0.4"
 
 show_help() {
-cat << EOF
-Replication Link Bond Setup Script (version $SCRIPT_VERSION)
-
-Usage: $0 [CONFIG_FILE]
-
-Configure a bonded interface and bridge for Proxmox point-to-point links.
+  cat <<EOF
+Usage: $0 [--config FILE] [--version] [--help]
 
 Options:
-  CONFIG_FILE      Optional path to a configuration file (bash key=value format).
-  -h, --help       Show this help message and exit.
-  -v, --version    Show Proxmox host version and script version.
+  --config FILE    Path to config file to run non-interactively
+  --version        Display script and PVE host version
+  --help           Show this help message
 
-Config File Format (bash-style):
+Config file format:
+  BOND_NAME=bond0
+  BRIDGE_NAME=vmbr1
   HOST_ID=0
-  SLAVES="eno2 eno3 eno4"
-  BOND_NAME="bond0"
-  BRIDGE_NAME="vmbr1"
-  SUBNET_PREFIX="10.100.160"
-  AUTO_APPLY=true     # Optional, skip confirmation and apply automatically
+  SLAVE_IFACES="eno2 eno3 eno4"
+  AUTO_APPLY=yes
 EOF
 }
 
 show_version() {
-    echo "pve-replication-link.sh version: $SCRIPT_VERSION"
-    if [[ -f /etc/pve/.version ]]; then
-        echo "Proxmox version:"
-        pveversion
-    else
-        echo "Proxmox version: Not detected"
-    fi
-    exit 0
+  echo "pve-replication-link.sh version $VERSION"
+  echo -n "Proxmox VE version: "; pveversion
+  exit 0
 }
 
-# Handle flags
-case "${1:-}" in
-    -h|--help)
-        show_help
-        exit 0
-        ;;
-    -v|--version)
-        show_version
-        ;;
-esac
+# Default values
+CONFIG_FILE=""
+AUTO_APPLY="no"
+BOND_NAME=""
+BRIDGE_NAME=""
+HOST_ID=""
+SLAVE_IFACES=""
 
-# Load config if passed
-CONFIG_FILE="${1:-}"
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --help|-h) show_help; exit 0;;
+    --version) show_version;;
+    --config) CONFIG_FILE="$2"; shift 2;;
+    *) echo "Unknown argument: $1"; show_help; exit 1;;
+  esac
+done
+
+# List existing bonds and bridges
+EXISTING_BONDS=$(grep -oP '^iface\s+\K(bond[0-9]+)' /etc/network/interfaces | sort -u)
+EXISTING_BRIDGES=$(grep -oP '^iface\s+\K(vmbr[0-9]+)' /etc/network/interfaces | sort -u)
+
+# Load config if provided
 if [[ -n "$CONFIG_FILE" ]]; then
-    if [[ -f "$CONFIG_FILE" ]]; then
-        echo "Loading configuration from $CONFIG_FILE..."
-        source "$CONFIG_FILE"
+  if [[ ! -f "$CONFIG_FILE" ]]; then
+    echo "Config file not found: $CONFIG_FILE"; exit 1
+  fi
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+fi
+
+# List available NICs
+ALL_NICS=$(ls /sys/class/net )
+USED_NICS=$(grep -E '^\s*(iface|bridge_ports|slaves)\s+' /etc/network/interfaces | grep -oE '[a-zA-Z0-9]+')
+AVAILABLE_NICS=()
+for nic in $ALL_NICS; do
+  if ! echo "$USED_NICS" | grep -qw "$nic"; then
+    AVAILABLE_NICS+=("$nic")
+  fi
+
+done
+
+if [[ ${#AVAILABLE_NICS[@]} -eq 0 ]]; then
+  echo "No available NICs for bonding. Aborting."
+  exit 1
+fi
+
+# Prompt functions
+prompt_or_quit() {
+  local prompt_msg="$1"
+  local var_name="$2"
+  local pattern="$3"
+  local reject_list="$4"
+  local input
+  while true; do
+    read -rp "$prompt_msg" input
+    [[ "$input" =~ ^[Qq](uit)?$ ]] && echo "Quitting." && exit 0
+    if [[ "$input" =~ $pattern ]]; then
+      if echo "$reject_list" | grep -qw "$input"; then
+        echo "$input already exists. Choose another."
+      else
+        eval $var_name="$input"
+        break
+      fi
     else
-        echo "Error: Config file '$CONFIG_FILE' not found."
-        exit 1
+      echo "Invalid input."
     fi
+  done
+}
+
+if [[ -z "$BOND_NAME" ]]; then
+  echo "Existing bond interfaces: ${EXISTING_BONDS:- (none)}"
+  prompt_or_quit "Enter name for new bond (e.g., bond0) [q to quit]: " BOND_NAME '^bond[0-9]+$' "$EXISTING_BONDS"
 fi
 
-# === Prompt/Defaults ===
-HOST_ID="${HOST_ID:-}"
+if echo "$EXISTING_BONDS" | grep -qw "$BOND_NAME"; then
+  echo "Error: Bond '$BOND_NAME' already exists in system configuration. Aborting."; exit 1
+fi
+
+if [[ -z "$BRIDGE_NAME" ]]; then
+  echo "Existing bridge interfaces: ${EXISTING_BRIDGES:- (none)}"
+  prompt_or_quit "Enter name for new bridge (e.g., vmbr1) [q to quit]: " BRIDGE_NAME '^vmbr[0-9]+$' "$EXISTING_BRIDGES"
+fi
+
+if echo "$EXISTING_BRIDGES" | grep -qw "$BRIDGE_NAME"; then
+  echo "Error: Bridge '$BRIDGE_NAME' already exists in system configuration. Aborting."; exit 1
+fi
+
 if [[ -z "$HOST_ID" ]]; then
-    read -p "Is this host IP .0 or .1? Enter 0 or 1: " HOST_ID
-fi
-if [[ "$HOST_ID" != "0" && "$HOST_ID" != "1" ]]; then
-    echo "Invalid HOST_ID: must be 0 or 1."
-    exit 1
-fi
-
-detect_unused_ifaces() {
-    for iface in $(ls /sys/class/net); do
-        [[ "$iface" =~ ^(lo|vmbr|bond|eno1)$ ]] && continue
-        ip link show "$iface" | grep -q "state UP" && continue
-        echo -n "$iface "
-    done
-}
-
-SLAVES="${SLAVES:-}"
-if [[ -z "$SLAVES" ]]; then
-    echo "Detected unused interfaces: $(detect_unused_ifaces)"
-    read -p "Enter space-separated interfaces to bond: " SLAVES
+  while true; do
+    read -rp "Is this host IP .0 or .1? Enter 0 or 1 [q to quit]: " input
+    [[ "$input" =~ ^[Qq](uit)?$ ]] && echo "Quitting." && exit 0
+    [[ "$input" =~ ^[01]$ ]] && HOST_ID="$input" && break
+    echo "Invalid input. Please enter 0 or 1."
+  done
 fi
 
-BOND_NAME="${BOND_NAME:-bond0}"
-BRIDGE_NAME="${BRIDGE_NAME:-vmbr1}"
-SUBNET_PREFIX="${SUBNET_PREFIX:-10.100.160}"
-IP="$SUBNET_PREFIX.$HOST_ID/31"
-AUTO_APPLY="${AUTO_APPLY:-false}"
+if [[ -z "$SLAVE_IFACES" ]]; then
+  echo "Available NICs for bonding:"
+  for nic in "${AVAILABLE_NICS[@]}"; do
+    echo "  - $nic"
+  done
+  read -rp "Enter space-separated NICs to bond (e.g., eno2 eno3) [q to quit]: " SLAVE_IFACES
+  [[ "$SLAVE_IFACES" =~ ^[Qq](uit)?$ ]] && echo "Quitting." && exit 0
+fi
 
-# === Idempotency Checks ===
-grep -q "iface $BOND_NAME" /etc/network/interfaces && {
-    echo "Bond interface '$BOND_NAME' already exists in /etc/network/interfaces."
-    exit 1
-}
-grep -q "iface $BRIDGE_NAME" /etc/network/interfaces && {
-    echo "Bridge '$BRIDGE_NAME' already exists in /etc/network/interfaces."
-    exit 1
-}
+# Create bond and bridge configuration
+IP_BASE="10.100.160"
+HOST_IP="$IP_BASE.$HOST_ID/31"
 
-# === Append Configuration to TEMP file ===
-cat << EOF > "$TMP_FILE"
-
-auto $BOND_NAME
-iface $BOND_NAME inet manual
-    bond-slaves $SLAVES
-    bond-miimon 100
-    bond-mode balance-xor
-    bond-xmit-hash-policy layer3+4
-
-auto $BRIDGE_NAME
-iface $BRIDGE_NAME inet static
-    address $IP
-    netmask 255.255.255.254
-    bridge-ports $BOND_NAME
-    bridge-stp off
-    bridge-fd 0
+cat <<EOF
+Configuration Summary:
+  Bond: $BOND_NAME with slaves: $SLAVE_IFACES
+  Bridge: $BRIDGE_NAME on $BOND_NAME
+  Host IP: $HOST_IP
 EOF
 
-# === Confirm and Apply ===
-echo
-echo "Planned configuration:"
-cat "$TMP_FILE"
-
-if [[ "$AUTO_APPLY" == "true" ]]; then
-    echo "AUTO_APPLY=true: Applying changes without confirmation..."
-    cat "$TMP_FILE" >> /etc/network/interfaces
-    ifreload -a
-    echo "Done."
-    rm -f "$TMP_FILE"
-    exit 0
+if [[ "$AUTO_APPLY" != "yes" ]]; then
+  read -rp "Apply changes and run ifreload? [y/N/q]: " CONFIRM
+  [[ "$CONFIRM" =~ ^[Qq]$ ]] && echo "Aborted." && exit 0
+  [[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Not applying changes."; exit 0; }
 fi
 
-echo
-read -p "Apply changes and run 'ifreload -a'? [y]es / [n]o / [a]bandon: " confirm
-case "$confirm" in
-    y|Y)
-        cat "$TMP_FILE" >> /etc/network/interfaces
-        echo "Reloading interfaces..."
-        ifreload -a
-        echo "Done."
-        ;;
-    n|N)
-        cat "$TMP_FILE" >> /etc/network/interfaces
-        echo "Changes written to /etc/network/interfaces."
-        echo "Reload manually with: ifreload -a"
-        ;;
-    a|A)
-        echo "Abandoning changes. Nothing was modified."
-        ;;
-    *)
-        echo "Invalid option. Aborting."
-        ;;
-esac
+# Write to /etc/network/interfaces.d
+INTERFACES_DIR="/etc/network/interfaces.d"
+BOND_FILE="$INTERFACES_DIR/$BOND_NAME"
+BRIDGE_FILE="$INTERFACES_DIR/$BRIDGE_NAME"
 
-rm -f "$TMP_FILE"
+[[ -f "$BOND_FILE" ]] && echo "$BOND_FILE already exists, aborting." && exit 1
+[[ -f "$BRIDGE_FILE" ]] && echo "$BRIDGE_FILE already exists, aborting." && exit 1
+
+cat > "$BOND_FILE" <<EOF
+auto $BOND_NAME
+iface $BOND_NAME inet manual
+  bond-slaves $SLAVE_IFACES
+  bond-miimon 100
+  bond-mode balance-xor
+  bond-xmit-hash-policy layer2+3
+EOF
+
+cat > "$BRIDGE_FILE" <<EOF
+auto $BRIDGE_NAME
+iface $BRIDGE_NAME inet static
+  address $HOST_IP
+  bridge-ports $BOND_NAME
+  bridge-stp off
+  bridge-fd 0
+EOF
+
+ifreload -a && echo "Interfaces updated successfully."
