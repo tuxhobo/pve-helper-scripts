@@ -10,3 +10,6 @@ bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/hea
 ```
 bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/heads/main/pve-replication-link.sh)"
 ```
+```
+bash -c "$(curl -fsSL https://github.com/tuxhobo/pve-helper-scripts/raw/refs/heads/main/create-replicator-user.sh)"
+```
